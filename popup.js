@@ -478,6 +478,49 @@ class BookmarkManager {
     await this.processCheckQueue();
   }
 
+  isLocalOrIntranetUrl(url) {
+    try {
+      const urlObj = new URL(url);
+      
+      const hostname = urlObj.hostname.toLowerCase();
+      
+      if (urlObj.protocol === 'file:') {
+        return true;
+      }
+      
+      if (hostname === 'localhost' || hostname === '127.0.0.1') {
+        return true;
+      }
+      
+      if (hostname.endsWith('.local')) {
+        return true;
+      }
+      
+      const ipPattern = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+      const match = hostname.match(ipPattern);
+      
+      if (match) {
+        const [, a, b, c, d] = match.map(Number);
+        
+        if (a === 10) {
+          return true;
+        }
+        
+        if (a === 172 && b >= 16 && b <= 31) {
+          return true;
+        }
+        
+        if (a === 192 && b === 168) {
+          return true;
+        }
+      }
+      
+      return false;
+    } catch (error) {
+      return false;
+    }
+  }
+
   async processCheckQueue() {
     const batchSize = 5;
     const delayBetweenBatches = 500;
@@ -504,6 +547,12 @@ class BookmarkManager {
   }
 
   async checkBookmark(bookmark) {
+    if (this.isLocalOrIntranetUrl(bookmark.url)) {
+      bookmark.status = 'valid';
+      this.checkResults.set(bookmark.id, { status: 'valid', url: bookmark.url, skipped: true });
+      return;
+    }
+    
     bookmark.status = 'checking';
     this.renderTable();
     
@@ -526,33 +575,103 @@ class BookmarkManager {
   }
 
   async checkLinkStatus(url) {
+    const maxRetries = 2;
+    const delays = [0, 1000, 2000];
+    
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (attempt > 0) {
+        await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+      }
+      
+      try {
+        const result = await this.tryCheckLink(url, attempt);
+        if (result.status !== 'timeout') {
+          return result;
+        }
+      } catch (error) {
+        console.log(`Attempt ${attempt + 1} failed for ${url}:`, error.message);
+      }
+    }
+    
+    return {
+      status: 'timeout',
+      url: url
+    };
+  }
+
+  async tryCheckLink(url, attempt) {
+    const timeout = 15000 + (attempt * 5000);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      const methods = attempt === 0 ? ['HEAD', 'GET'] : ['GET'];
       
-      const response = await fetch(url, {
-        method: 'HEAD',
-        mode: 'no-cors',
-        signal: controller.signal
-      });
+      for (const method of methods) {
+        try {
+          const response = await fetch(url, {
+            method: method,
+            mode: 'no-cors',
+            cache: 'no-cache',
+            redirect: 'follow',
+            signal: controller.signal,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+          });
+          
+          clearTimeout(timeoutId);
+          
+          return {
+            status: 'valid',
+            url: url
+          };
+        } catch (fetchError) {
+          if (fetchError.name !== 'TypeError' && fetchError.name !== 'AbortError') {
+            throw fetchError;
+          }
+        }
+      }
       
+      throw new Error('All methods failed');
+      
+    } catch (error) {
       clearTimeout(timeoutId);
       
-      return {
-        status: 'valid',
-        url: url
-      };
-    } catch (error) {
       if (error.name === 'AbortError') {
         return {
           status: 'timeout',
           url: url
         };
       }
+      
+      if (error.message && (
+        error.message.includes('Failed to fetch') ||
+        error.message.includes('NetworkError') ||
+        error.message.includes('All methods failed')
+      )) {
+        return {
+          status: 'timeout',
+          url: url
+        };
+      }
+      
+      if (error.message && (
+        error.message.includes('ERR_NAME_NOT_RESOLVED') ||
+        error.message.includes('ERR_CONNECTION_REFUSED') ||
+        error.message.includes('ERR_CONNECTION_TIMED_OUT') ||
+        error.message.includes('DNS_PROBE')
+      )) {
+        return {
+          status: 'invalid',
+          url: url,
+          error: error.message
+        };
+      }
+      
       return {
-        status: 'invalid',
-        url: url,
-        error: error.message
+        status: 'timeout',
+        url: url
       };
     }
   }
@@ -577,6 +696,7 @@ class BookmarkManager {
     const valid = this.flattenedBookmarks.filter(b => b.status === 'valid').length;
     const invalid = this.flattenedBookmarks.filter(b => b.status === 'invalid').length;
     const timeout = this.flattenedBookmarks.filter(b => b.status === 'timeout').length;
+    const skipped = Array.from(this.checkResults.values()).filter(r => r.skipped).length;
     
     document.getElementById('totalCount').textContent = total;
     document.getElementById('validCount').textContent = valid;
